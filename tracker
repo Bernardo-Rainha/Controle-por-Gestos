@@ -1,0 +1,908 @@
+"""
+Sistema de Reconhecimento de Gestos - Zoom com Distância Dinâmica no Ponto Médio
+"""
+
+import cv2
+import mediapipe as mp
+import math
+import time
+import platform
+import sys
+from collections import deque
+from typing import List, Dict, Optional, Tuple, Any
+import pyautogui
+import numpy as np
+import faulthandler
+
+# Habilita faulthandler para debug
+faulthandler.enable()
+
+# Configurações globais
+pyautogui.PAUSE = 0
+pyautogui.FAILSAFE = False
+
+# Obtém dimensões da tela
+screen_w, screen_h = pyautogui.size()
+
+# Configuração do MediaPipe
+BaseOptions = mp.tasks.BaseOptions
+handLandmarker = mp.tasks.vision.HandLandmarker
+handLandmarkerOptions = mp.tasks.vision.HandLandmarkerOptions
+VisionRunningMode = mp.tasks.vision.RunningMode
+
+MODEL_PATH = "hand_landmarker.task"
+
+# Type aliases
+Landmark = Any
+HandLandmarks = List[Landmark]
+Frame = np.ndarray
+
+def safe_distance(a: Landmark, b: Landmark) -> float:
+    try:
+        if a is None or b is None:
+            return 0.0
+        return math.sqrt((a.x - b.x) ** 2 + (a.y - b.y) ** 2)
+    except (AttributeError, TypeError):
+        return 0.0
+
+def safe_angle(a: Landmark, b: Landmark, c: Landmark) -> float:
+    try:
+        if a is None or b is None or c is None:
+            return 0.0
+
+        ba = (a.x - b.x, a.y - b.y)
+        bc = (c.x - b.x, c.y - b.y)
+        dot = ba[0] * bc[0] + ba[1] * bc[1]
+        mag_ba = math.sqrt(ba[0] ** 2 + ba[1] ** 2)
+        mag_bc = math.sqrt(bc[0] ** 2 + bc[1] ** 2)
+
+        if mag_ba == 0 or mag_bc == 0:
+            return 0.0
+
+        value = dot / (mag_ba * mag_bc)
+        value = max(-1.0, min(1.0, value))
+        return math.degrees(math.acos(value))
+    except (AttributeError, TypeError, ValueError):
+        return 0.0
+
+def safe_finger_extended(hand: HandLandmarks, pip: int, dip: int, tip: int) -> bool:
+    try:
+        if len(hand) <= tip:
+            return False
+        pip_angle = safe_angle(hand[pip - 1], hand[pip], hand[dip])
+        dip_angle = safe_angle(hand[pip], hand[dip], hand[tip])
+        return (pip_angle > 155 and dip_angle > 150)
+    except (IndexError, TypeError):
+        return False
+
+def safe_get_fingers(hand: HandLandmarks) -> Dict[str, bool]:
+    return {
+        "index": safe_finger_extended(hand, 6, 7, 8),
+        "middle": safe_finger_extended(hand, 10, 11, 12),
+        "ring": safe_finger_extended(hand, 14, 15, 16),
+        "pinky": safe_finger_extended(hand, 18, 19, 20)
+    }
+
+def safe_detect_point(hand: HandLandmarks, fingers: Dict[str, bool]) -> int:
+    score = 0
+    if fingers.get("index", False): score += 40
+    if not fingers.get("middle", True): score += 20
+    if not fingers.get("ring", True): score += 20
+    if not fingers.get("pinky", True): score += 20
+    return score
+
+def safe_detect_open(hand: HandLandmarks, fingers: Dict[str, bool]) -> int:
+    score = 0
+    if fingers.get("index", False): score += 25
+    if fingers.get("middle", False): score += 25
+    if fingers.get("ring", False): score += 25
+    if fingers.get("pinky", False): score += 25
+    return score
+
+def safe_detect_fist(hand: HandLandmarks, fingers: Dict[str, bool]) -> int:
+    score = 0
+    if not fingers.get("index", True): score += 25
+    if not fingers.get("middle", True): score += 25
+    if not fingers.get("ring", True): score += 25
+    if not fingers.get("pinky", True): score += 25
+    return score
+
+def safe_detect_pinch(hand: HandLandmarks, fingers: Dict[str, bool]) -> int:
+    try:
+        if len(hand) <= 9:
+            return 0
+        hand_scale = safe_distance(hand[0], hand[9])
+        if hand_scale == 0: 
+            return 0
+            
+        pinch_distance = safe_distance(hand[4], hand[8]) / hand_scale
+        
+        if pinch_distance < 0.20: 
+            return 100 
+        if pinch_distance < 0.30: 
+            return 60
+        if pinch_distance < 0.40: 
+            return 30
+            
+        return 0
+    except (IndexError, ZeroDivisionError):
+        return 0
+
+def safe_detect_drag(hand: HandLandmarks, fingers: Dict[str, bool]) -> int:
+    try:
+        if len(hand) <= 20:
+            return 0
+        scale = safe_distance(hand[0], hand[9])
+        if scale == 0: 
+            return 0
+
+        d_index = safe_distance(hand[4], hand[8]) / scale
+        d_mid = safe_distance(hand[4], hand[12]) / scale
+        d_ring = safe_distance(hand[4], hand[16]) / scale
+        d_pinky = safe_distance(hand[4], hand[20]) / scale
+
+        avg_dist = (d_index + d_mid + d_ring + d_pinky) / 4
+        max_dist = max(d_index, d_mid, d_ring, d_pinky)
+
+        if avg_dist < 0.25 and max_dist < 0.40: 
+            return 110 
+        if avg_dist < 0.30 and max_dist < 0.45: 
+            return 80
+        if avg_dist < 0.35: 
+            return 50
+        return 0
+    except (IndexError, ZeroDivisionError):
+        return 0
+
+class SafeSwipeDetector:
+    def __init__(self):
+        self.positions: deque = deque(maxlen=20)
+        self.cooldown_until: float = 0.0
+
+    def update(self, x: float, y: float) -> Optional[str]:
+        try:
+            now = time.time()
+            self.positions.append((x, y, now))
+
+            if now < self.cooldown_until: 
+                return None
+            if len(self.positions) < 5: 
+                return None
+
+            x0, y0, t0 = self.positions[0]
+            dx = x - x0
+            dy = y - y0
+            dt = now - t0
+
+            if dt <= 0 or dt > 0.7:
+                if dt > 0.7: 
+                    self.positions.popleft()
+                return None
+
+            if abs(dx) <= 2 * abs(dy) or abs(dx) < 0.35: 
+                return None
+
+            velocity = math.sqrt(dx ** 2 + dy ** 2) / dt
+            if velocity < 0.8: 
+                return None
+
+            gesture = "SWIPE RIGHT" if dx > 0 else "SWIPE LEFT"
+            self.cooldown_until = now + 0.5
+            self.positions.clear()
+            return gesture
+        except Exception:
+            return None
+
+class SafeGestureStateMachine:
+    def __init__(self):
+        self.current: str = "NONE"
+        self.candidate: Optional[str] = None
+        self.counter: int = 0
+        self.required_frames: int = 5
+
+    def update(self, detected: str) -> Tuple[str, List[str]]:
+        events: List[str] = []
+        try:
+            if detected == self.current:
+                events.append(f"{self.current}_HOLD")
+                return self.current, events
+
+            if detected == self.candidate:
+                self.counter += 1
+            else:
+                self.candidate = detected
+                self.counter = 1
+
+            if self.counter >= self.required_frames:
+                previous = self.current
+                self.current = detected
+                self.counter = 0
+                self.candidate = None
+
+                if previous != "NONE":
+                    events.append(f"{previous}_END")
+                events.append(f"{self.current}_START")
+
+        except Exception as e:
+            print(f"Erro na máquina de estados: {e}")
+
+        return self.current, events
+
+class SafeDualPinchZoom:
+    def __init__(self):
+        self.active: bool = False
+        self.start_distance: Optional[float] = None
+
+    def start(self, distance_val: float) -> None:
+        self.active = True
+        self.start_distance = distance_val
+
+    def stop(self) -> None:
+        self.active = False
+        self.start_distance = None
+
+    def factor(self, current_distance: float) -> float:
+        try:
+            if not self.active or self.start_distance is None or self.start_distance == 0:
+                return 1.0
+            return current_distance / self.start_distance
+        except ZeroDivisionError:
+            return 1.0
+
+# Constantes para desenho
+CONNECTIONS = [
+    (0, 1), (1, 2), (2, 3), (3, 4),           
+    (0, 5), (5, 6), (6, 7), (7, 8),           
+    (0, 9), (9, 10), (10, 11), (11, 12),      
+    (0, 13), (13, 14), (14, 15), (15, 16),    
+    (0, 17), (17, 18), (18, 19), (19, 20),    
+    (5, 9), (9, 13), (13, 17)                 
+]
+
+def safe_draw_hand(frame: Frame, hand: HandLandmarks, 
+                   color: Tuple[int, int, int] = (255, 255, 255), 
+                   point_color: Tuple[int, int, int] = (0, 255, 0)) -> None:
+    try:
+        if frame is None or hand is None or len(hand) == 0:
+            return
+
+        height, width = frame.shape[:2]
+
+        for start, end in CONNECTIONS:
+            if start < len(hand) and end < len(hand):
+                x1, y1 = int(hand[start].x * width), int(hand[start].y * height)
+                x2, y2 = int(hand[end].x * width), int(hand[end].y * height)
+                cv2.line(frame, (x1, y1), (x2, y2), color, 2)
+
+        for i, point in enumerate(hand):
+            x, y = int(point.x * width), int(point.y * height)
+            cv2.circle(frame, (x, y), 5, point_color, -1)
+    except Exception as e:
+        print(f"Erro ao desenhar mão: {e}")
+
+# --- Funções PyAutoGUI com Verificação ---
+def safe_pyautogui_move(x: float, y: float) -> None:
+    try:
+        x = max(0, min(int(x), screen_w - 1))
+        y = max(0, min(int(y), screen_h - 1))
+        pyautogui.moveTo(x, y)
+    except Exception:
+        pass
+
+def safe_pyautogui_click() -> None:
+    try:
+        pyautogui.click()
+    except Exception:
+        pass
+
+def safe_pyautogui_scroll(amount: int) -> None:
+    try:
+        amount = max(-1000, min(1000, amount))
+        pyautogui.scroll(amount)
+    except Exception:
+        pass
+
+def safe_pyautogui_hscroll(amount: int) -> None:
+    try:
+        amount = max(-1000, min(1000, amount))
+        pyautogui.keyDown('shift')
+        pyautogui.scroll(amount)
+        pyautogui.keyUp('shift')
+    except Exception:
+        pyautogui.keyUp('shift')
+
+def safe_pyautogui_mouse_down() -> None:
+    try: pyautogui.mouseDown()
+    except Exception: pass
+
+def safe_pyautogui_mouse_up() -> None:
+    try: pyautogui.mouseUp()
+    except Exception: pass
+
+def safe_pyautogui_hotkey(*keys: str) -> None:
+    try: pyautogui.hotkey(*keys)
+    except Exception: pass
+
+def safe_pyautogui_key_down(key: str) -> None:
+    try: pyautogui.keyDown(key)
+    except Exception: pass
+
+def safe_pyautogui_key_up(key: str) -> None:
+    try: pyautogui.keyUp(key)
+    except Exception: pass
+
+def safe_pyautogui_press(key: str) -> None:
+    try: pyautogui.press(key)
+    except Exception: pass
+
+# ============================================================
+# SISTEMA DE JANELA FANTASMA
+# ============================================================
+
+class GhostWindow:
+    def __init__(self):
+        self.window_name = "Gesture Recognition"
+        self.hwnd = None
+        self.user32 = None
+        self.gdi32 = None
+        self.last_check = 0.0
+        self.check_interval = 0.3
+
+        self.GWL_EXSTYLE = -20
+        self.WS_EX_LAYERED = 0x00080000
+        self.WS_EX_TRANSPARENT = 0x00000020
+        self.WS_EX_TOPMOST = 0x00000008
+        self.WS_EX_NOACTIVATE = 0x08000000
+        self.WS_EX_TOOLWINDOW = 0x00000080
+
+        self.HWND_TOPMOST = -1
+        self.HWND_NOTOPMOST = -2
+        self.SWP_NOMOVE = 0x0002
+        self.SWP_NOSIZE = 0x0001
+        self.SWP_NOACTIVATE = 0x0010
+        self.SWP_SHOWWINDOW = 0x0040
+        self.SWP_FRAMECHANGED = 0x0020
+
+    def setup(self):
+        if platform.system() != "Windows":
+            cv2.namedWindow(self.window_name, cv2.WINDOW_NORMAL)
+            return False
+
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            self.user32 = ctypes.windll.user32
+            self.gdi32 = ctypes.windll.gdi32
+
+            cv2.namedWindow(self.window_name, cv2.WINDOW_NORMAL)
+
+            dummy = np.zeros((720, 1280, 3), dtype=np.uint8)
+            cv2.imshow(self.window_name, dummy)
+            cv2.waitKey(300)
+
+            self.hwnd = self.user32.FindWindowW(None, self.window_name)
+            if not self.hwnd:
+                print("⚠ Handle não encontrado")
+                return False
+
+            ex_style = self.user32.GetWindowLongW(self.hwnd, self.GWL_EXSTYLE)
+            new_style = (ex_style | self.WS_EX_LAYERED | self.WS_EX_TRANSPARENT | 
+                        self.WS_EX_TOPMOST | self.WS_EX_NOACTIVATE | self.WS_EX_TOOLWINDOW)
+            self.user32.SetWindowLongW(self.hwnd, self.GWL_EXSTYLE, new_style)
+
+            self.user32.SetWindowPos(self.hwnd, 0, 0, 0, 0, 0,
+                                    self.SWP_NOMOVE | self.SWP_NOSIZE | 
+                                    self.SWP_NOACTIVATE | self.SWP_FRAMECHANGED)
+
+            self.user32.SetLayeredWindowAttributes(self.hwnd, 0, 100, 2)
+            self.force_topmost()
+
+            print(f"✓ Janela fantasma ativa (handle: {self.hwnd})")
+            return True
+
+        except Exception as e:
+            print(f"⚠ Erro na configuração da janela: {e}")
+            cv2.namedWindow(self.window_name, cv2.WINDOW_NORMAL)
+            return False
+
+    def force_topmost(self):
+        if not self.hwnd or not self.user32:
+            return False
+
+        try:
+            result = self.user32.SetWindowPos(
+                self.hwnd, self.HWND_TOPMOST, 0, 0, 0, 0,
+                self.SWP_NOMOVE | self.SWP_NOSIZE | 
+                self.SWP_NOACTIVATE | self.SWP_SHOWWINDOW
+            )
+
+            if not result:
+                self.user32.keybd_event(0x12, 0, 0, 0)
+                self.user32.SetForegroundWindow(self.hwnd)
+                self.user32.keybd_event(0x12, 0, 2, 0)
+
+            self.user32.BringWindowToTop(self.hwnd)
+            return True
+
+        except Exception as e:
+            print(f"Erro ao forçar topmost: {e}")
+            return False
+
+    def maintain_topmost(self):
+        if not self.hwnd or not self.user32:
+            return
+
+        now = time.time()
+        if now - self.last_check < self.check_interval:
+            return
+
+        self.last_check = now
+
+        try:
+            topmost_hwnd = self.user32.GetTopWindow(None)
+            if topmost_hwnd != self.hwnd:
+                self.force_topmost()
+        except:
+            pass
+
+    def set_fullscreen(self):
+        try:
+            cv2.setWindowProperty(self.window_name, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
+        except:
+            pass
+
+def setup_camera() -> cv2.VideoCapture:
+    camera = cv2.VideoCapture(0)
+    cam_w, cam_h = 1280, 720
+    camera.set(cv2.CAP_PROP_FRAME_WIDTH, cam_w)
+    camera.set(cv2.CAP_PROP_FRAME_HEIGHT, cam_h)
+
+    if not camera.isOpened():
+        print("ERRO: não foi possível abrir a câmera.")
+        sys.exit(1)
+
+    return camera
+
+def main() -> None:
+    camera = setup_camera()
+
+    ghost_window = GhostWindow()
+    ghost_window.setup()
+    ghost_window.set_fullscreen()
+
+    options = handLandmarkerOptions(
+        base_options=BaseOptions(model_asset_path=MODEL_PATH),
+        running_mode=VisionRunningMode.VIDEO,
+        num_hands=2,
+        min_hand_detection_confidence=0.5,
+        min_hand_presence_confidence=0.5,
+        min_tracking_confidence=0.5
+    )
+
+    swipe_detectors = [SafeSwipeDetector(), SafeSwipeDetector()]
+    gesture_machines = [SafeGestureStateMachine(), SafeGestureStateMachine()]
+    
+    # Variáveis 2D para o centro da zona neutra de scroll
+    scroll_anchor_x: List[Optional[float]] = [None, None]
+    scroll_anchor_y: List[Optional[float]] = [None, None]
+    scroll_start_x_px: List[Optional[int]] = [None, None]
+    scroll_start_y_px: List[Optional[int]] = [None, None]
+    
+    point_trails: List[deque] = [deque(maxlen=30), deque(maxlen=30)] 
+    prev_wrists: List[Optional[Tuple[float, float]]] = [None, None] 
+    zoom_controller = SafeDualPinchZoom()
+    
+    click_visuals: List[Tuple[int, int, float]] = []
+
+    # Variáveis de suavização do mouse
+    plocX, plocY = 0.0, 0.0
+    clocX, clocY = 0.0, 0.0
+    smoothening = 2
+
+    # Variáveis do Alt+Tab
+    alt_tab_active = False
+    alt_tab_anchor_x: Optional[float] = None
+    alt_tab_cooldown = 0.0
+
+    frame_count = 0
+    last_debug = time.time()
+
+    # Variáveis para usar o Tempo Real em Milissegundos
+    start_time_ms = int(time.perf_counter() * 1000)
+    last_timestamp_ms = -1
+
+    print("\n🔥 SCRIPT INICIADO!")
+    print("AVISO: Pressione Ctrl+C no terminal para sair.\n")
+
+    try:
+        with handLandmarker.create_from_options(options) as landmarker:
+            while True:
+                success, frame = camera.read()
+                if not success:
+                    print("⚠ Falha na câmera...")
+                    time.sleep(0.1)
+                    continue
+
+                frame_count += 1
+                now = time.time()
+
+                # BLOQUEIO DO TOPMOST
+                if not alt_tab_active and not zoom_controller.active:
+                    ghost_window.maintain_topmost()
+
+                if now - last_debug > 10.0:
+                    print(f"  [Status] Frame {frame_count}, FPS: ~{frame_count/10:.1f}")
+                    frame_count = 0
+                    last_debug = now
+
+                frame = cv2.flip(frame, 1)
+                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+
+                current_time_ms = int(time.perf_counter() * 1000)
+                timestamp_ms = current_time_ms - start_time_ms
+                
+                if timestamp_ms <= last_timestamp_ms:
+                    timestamp_ms = last_timestamp_ms + 1
+                last_timestamp_ms = timestamp_ms
+
+                result = landmarker.detect_for_video(mp_image, timestamp_ms)
+
+                active_gestures = ["NONE", "NONE"]
+                scores_list = [{"POINT": 0, "PINCH": 0, "OPEN": 0, "FIST": 0, "DRAG": 0} for _ in range(2)]
+                assigned_hands: List[Optional[HandLandmarks]] = [None, None] 
+
+                if result.hand_landmarks and len(result.hand_landmarks) > 0:
+                    curr_hands = list(result.hand_landmarks[:2])
+                    unmatched_curr = []
+                    available_indices = [0, 1]
+
+                    for hand in curr_hands:
+                        if hand is None or len(hand) == 0:
+                            continue
+
+                        wx, wy = hand[0].x, hand[0].y
+                        best_i = None
+                        min_d = float('inf')
+
+                        for i in available_indices:
+                            if prev_wrists[i] is not None:
+                                d = math.hypot(wx - prev_wrists[i][0], wy - prev_wrists[i][1])
+                                if d < 0.2 and d < min_d: 
+                                    min_d = d
+                                    best_i = i
+
+                        if best_i is not None:
+                            assigned_hands[best_i] = hand
+                            available_indices.remove(best_i)
+                        else:
+                            unmatched_curr.append(hand)
+
+                    for hand in unmatched_curr:
+                        if available_indices:
+                            i = available_indices.pop(0)
+                            assigned_hands[i] = hand
+
+                for i in range(2):
+                    if assigned_hands[i] is not None and len(assigned_hands[i]) > 0:
+                        prev_wrists[i] = (assigned_hands[i][0].x, assigned_hands[i][0].y)
+                    else:
+                        prev_wrists[i] = None
+
+                for i in range(2):
+                    hand = assigned_hands[i]
+
+                    if hand is None or len(hand) == 0:
+                        point_trails[i].clear()
+                        scroll_anchor_x[i] = None
+                        scroll_anchor_y[i] = None
+                        scroll_start_x_px[i] = None
+                        scroll_start_y_px[i] = None
+                        continue
+
+                    color = (255, 255, 255) if i == 0 else (255, 0, 0)
+                    safe_draw_hand(frame, hand, color=color, point_color=(0, 255, 0))
+
+                    fingers = safe_get_fingers(hand)
+                    scale = safe_distance(hand[0], hand[9]) if len(hand) > 9 else 0.0
+
+                    scores_list[i]["POINT"] = safe_detect_point(hand, fingers)
+                    scores_list[i]["OPEN"] = safe_detect_open(hand, fingers)
+                    scores_list[i]["FIST"] = safe_detect_fist(hand, fingers)
+                    scores_list[i]["PINCH"] = safe_detect_pinch(hand, fingers)
+                    scores_list[i]["DRAG"] = safe_detect_drag(hand, fingers) 
+
+                    index_tip = hand[8] if len(hand) > 8 else None
+                    swipe = None
+                    if index_tip is not None:
+                        swipe = swipe_detectors[i].update(index_tip.x, index_tip.y)
+
+                    detected_gesture = "NONE"
+                    if swipe:
+                        detected_gesture = swipe
+                    else:
+                        best_gesture = max(scores_list[i], key=scores_list[i].get)
+                        if scores_list[i][best_gesture] >= 80:
+                            detected_gesture = best_gesture
+                        else:
+                            detected_gesture = "UNKNOWN"
+
+                    active_gesture, events = gesture_machines[i].update(detected_gesture)
+                    active_gestures[i] = active_gesture
+
+                    ix, iy = 0, 0
+
+                    # --- CONTROLE DO MOUSE ---
+                    if active_gesture in ["POINT", "DRAG", "PINCH"]:
+                        if scale > 0 and len(hand) > 20:
+                            d_index = safe_distance(hand[4], hand[8]) / scale
+                            d_mid = safe_distance(hand[4], hand[12]) / scale
+                            d_ring = safe_distance(hand[4], hand[16]) / scale
+                            d_pinky = safe_distance(hand[4], hand[20]) / scale
+
+                            avg_dist = (d_index + d_mid + d_ring + d_pinky) / 4
+
+                            t_pinch = max(0.0, min(1.0, (0.35 - d_index) / 0.20))
+                            t_drag = max(0.0, min(1.0, (0.45 - avg_dist) / 0.20))
+
+                            if t_drag > t_pinch + 0.1: 
+                                mid_x = sum(hand[f].x for f in [4, 8, 12, 16, 20]) / 5
+                                mid_y = sum(hand[f].y for f in [4, 8, 12, 16, 20]) / 5
+                                t = t_drag
+                            else:
+                                mid_x = (hand[4].x + hand[8].x) / 2
+                                mid_y = (hand[4].y + hand[8].y) / 2
+                                t = t_pinch
+
+                            ix = int((hand[8].x * (1 - t) + mid_x * t) * screen_w)
+                            iy = int((hand[8].y * (1 - t) + mid_y * t) * screen_h)
+
+                        if i == 0:
+                            clocX = plocX + (ix - plocX) / smoothening
+                            clocY = plocY + (iy - plocY) / smoothening
+                            safe_pyautogui_move(clocX, clocY)
+                            plocX, plocY = clocX, clocY
+
+                            cam_ix = int(clocX * 1280 / screen_w)
+                            cam_iy = int(clocY * 720 / screen_h)
+                        else:
+                            cam_ix = int(ix * 1280 / screen_w)
+                            cam_iy = int(iy * 720 / screen_h)
+
+                        if len(point_trails[i]) > 0:
+                            last_x, last_y = point_trails[i][-1]
+                            dist_jump = math.sqrt((cam_ix - last_x)**2 + (cam_iy - last_y)**2)
+                            if dist_jump > 150:
+                                point_trails[i].clear()
+
+                        point_trails[i].append((cam_ix, cam_iy))
+                        if len(point_trails[i]) > 1:
+                            points = list(point_trails[i])
+                            for j in range(1, len(points)):
+                                thickness = int(math.sqrt(j) * 1.5)
+                                cv2.line(frame, points[j - 1], points[j], (0, 0, 255), thickness, cv2.LINE_AA)
+                    else:
+                        point_trails[i].clear()
+
+                    # --- CONTROLE DE SCROLL: TRAVA DE EIXO (X/Y) ---
+                    if active_gesture == "FIST" and len(hand) > 0:
+                        wrist_x = hand[0].x
+                        wrist_y = hand[0].y
+                        wx = int(wrist_x * frame.shape[1])
+                        wy = int(wrist_y * frame.shape[0])
+
+                        if scroll_anchor_y[i] is None or scroll_anchor_x[i] is None:
+                            scroll_anchor_x[i] = wrist_x
+                            scroll_anchor_y[i] = wrist_y
+                            scroll_start_x_px[i] = wx
+                            scroll_start_y_px[i] = wy
+
+                        cx = scroll_start_x_px[i]
+                        cy = scroll_start_y_px[i]
+
+                        delta_x = wrist_x - scroll_anchor_x[i]
+                        delta_y = wrist_y - scroll_anchor_y[i]
+                        deadzone_norm = 0.03 
+
+                        is_scrolling = abs(delta_x) > deadzone_norm or abs(delta_y) > deadzone_norm
+                        draw_x, draw_y = wx, wy
+                        
+                        if is_scrolling:
+                            if abs(delta_x) > abs(delta_y):
+                                draw_y = cy 
+                                cv2.putText(frame, "HORIZ", (wx, wy - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (50, 255, 50), 2)
+                                
+                                scroll_amount_x = 0
+                                if delta_x < -deadzone_norm:
+                                    scroll_amount_x = int((abs(delta_x) - deadzone_norm) * 500) 
+                                elif delta_x > deadzone_norm:
+                                    scroll_amount_x = int(-(abs(delta_x) - deadzone_norm) * 500) 
+                                    
+                                if i == 0 and scroll_amount_x != 0:
+                                    safe_pyautogui_hscroll(scroll_amount_x)
+                            else:
+                                draw_x = cx 
+                                cv2.putText(frame, "VERT", (wx + 20, wy), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (50, 255, 50), 2)
+                                
+                                scroll_amount_y = 0
+                                if delta_y < -deadzone_norm:
+                                    scroll_amount_y = int((abs(delta_y) - deadzone_norm) * 500) 
+                                elif delta_y > deadzone_norm:
+                                    scroll_amount_y = int(-(abs(delta_y) - deadzone_norm) * 500) 
+                                    
+                                if i == 0 and scroll_amount_y != 0:
+                                    safe_pyautogui_scroll(scroll_amount_y)
+
+                            thumb_color = (50, 255, 50) 
+                            line_thick = 3
+                        else:
+                            thumb_color = (0, 255, 255) 
+                            line_thick = 2
+
+                        deadzone_px = 35 
+                        cv2.circle(frame, (cx, cy), deadzone_px, (200, 200, 200), 2, cv2.LINE_AA)
+                        cv2.circle(frame, (cx, cy), 4, (200, 200, 200), -1)
+
+                        cv2.line(frame, (cx, cy), (draw_x, draw_y), thumb_color, line_thick, cv2.LINE_AA)
+                        cv2.circle(frame, (draw_x, draw_y), 10, thumb_color, -1, cv2.LINE_AA)
+
+                    else:
+                        scroll_anchor_x[i] = None
+                        scroll_anchor_y[i] = None
+                        scroll_start_x_px[i] = None
+                        scroll_start_y_px[i] = None
+
+                    # --- EVENTOS DE CLIQUE ---
+                    if events:
+                        for event in events:
+                            if event == "PINCH_START" and len(hand) > 8:
+                                px = int((hand[4].x + hand[8].x) / 2 * frame.shape[1])
+                                py = int((hand[4].y + hand[8].y) / 2 * frame.shape[0])
+                                click_visuals.append((px, py, now))
+                                if i == 0: 
+                                    safe_pyautogui_click()
+
+                            elif event == "DRAG_START":
+                                if i == 0: 
+                                    safe_pyautogui_mouse_down()
+
+                            elif event == "DRAG_END":
+                                if i == 0: 
+                                    safe_pyautogui_mouse_up()
+
+                # --- LÓGICA DO FEEDBACK FLUTUANTE NAS MÃOS ---
+                for i in range(2):
+                    if assigned_hands[i] is not None and len(assigned_hands[i]) > 0:
+                        hand = assigned_hands[i]
+                        gesture_text = active_gestures[i]
+                        
+                        wx = int(hand[0].x * frame.shape[1])
+                        wy = int(hand[0].y * frame.shape[0])
+                        
+                        text_x = wx + 30
+                        text_y = wy - 30
+                        
+                        (text_w, text_h), baseline = cv2.getTextSize(gesture_text, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
+                        
+                        text_x = max(10, min(text_x, frame.shape[1] - text_w - 20))
+                        text_y = max(text_h + 10, min(text_y, frame.shape[0] - 10))
+                        
+                        cv2.rectangle(frame, (text_x - 5, text_y - text_h - 10), (text_x + text_w + 5, text_y + 5), (0, 0, 0), -1)
+                        cv2.rectangle(frame, (text_x - 5, text_y - text_h - 10), (text_x + text_w + 5, text_y + 5), (100, 100, 100), 1)
+                        
+                        text_color = (0, 255, 255) if i == 0 else (255, 200, 100)
+                        cv2.putText(frame, gesture_text, (text_x, text_y - 2), cv2.FONT_HERSHEY_SIMPLEX, 0.6, text_color, 2)
+
+
+                # --- PROCESSAMENTO COM DUAS MÃOS ---
+                if (assigned_hands[0] is not None and assigned_hands[1] is not None and
+                    len(assigned_hands[0]) > 8 and len(assigned_hands[1]) > 8):
+
+                    # Lógica do Alt + Tab
+                    if active_gestures[0] == "OPEN" and active_gestures[1] == "OPEN":
+                        current_x = assigned_hands[0][0].x
+
+                        if not alt_tab_active:
+                            alt_tab_active = True
+                            safe_pyautogui_key_down('alt')
+                            alt_tab_anchor_x = current_x
+                            safe_pyautogui_press('tab')
+                            alt_tab_cooldown = now + 0.4
+                        else:
+                            if now > alt_tab_cooldown and alt_tab_anchor_x is not None:
+                                dx = current_x - alt_tab_anchor_x
+                                
+                                if dx > 0.08:
+                                    safe_pyautogui_press('tab')
+                                    alt_tab_anchor_x = current_x
+                                    alt_tab_cooldown = now + 0.3
+                                elif dx < -0.08:
+                                    safe_pyautogui_hotkey('shift', 'tab')
+                                    alt_tab_anchor_x = current_x
+                                    alt_tab_cooldown = now + 0.3
+                    else:
+                        if alt_tab_active:
+                            alt_tab_active = False
+                            safe_pyautogui_key_up('alt')
+                            alt_tab_anchor_x = None
+
+                    # Lógica de Pinch Zoom com Distância Exata no Ponto Médio
+                    if active_gestures[0] == "PINCH" and active_gestures[1] == "PINCH":
+                        h1 = assigned_hands[0][8] # Indicador da mão 0
+                        h2 = assigned_hands[1][8] # Indicador da mão 1
+                        
+                        # Coordenadas em pixels para desenho
+                        p1_px = (int(h1.x * frame.shape[1]), int(h1.y * frame.shape[0]))
+                        p2_px = (int(h2.x * frame.shape[1]), int(h2.y * frame.shape[0]))
+                        
+                        # Ponto médio exato entre os dois dedos
+                        mid_px = ((p1_px[0] + p2_px[0]) // 2, (p1_px[1] + p2_px[1]) // 2)
+
+                        # Distância matemática (em pixels e normalizada)
+                        pixel_distance = math.hypot(p1_px[0] - p2_px[0], p1_px[1] - p2_px[1])
+                        dist = math.sqrt((h1.x - h2.x)**2 + (h1.y - h2.y)**2)
+
+                        if not zoom_controller.active:
+                            zoom_controller.start(dist)
+                        else:
+                            zoom_factor = zoom_controller.factor(dist)
+
+                            # Desenha linha conectando as duas mãos e exibe a distância no ponto médio
+                            cv2.line(frame, p1_px, p2_px, (255, 255, 0), 2, cv2.LINE_AA)
+                            
+                            status_str = f"ZOOM {zoom_factor:.2f}x ({int(pixel_distance)}px)"
+                            (tw, th), _ = cv2.getTextSize(status_str, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 2)
+                            
+                            box_x = mid_px[0] - tw // 2
+                            box_y = mid_px[1] - 15
+                            
+                            cv2.rectangle(frame, (box_x - 6, box_y - th - 6), (box_x + tw + 6, box_y + 6), (0, 0, 0), -1)
+                            cv2.rectangle(frame, (box_x - 6, box_y - th - 6), (box_x + tw + 6, box_y + 6), (255, 255, 0), 1)
+                            cv2.putText(frame, status_str, (box_x, box_y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
+
+                            if zoom_factor > 1.15:
+                                safe_pyautogui_hotkey('ctrl', '+')
+                                zoom_controller.start(dist)
+                            elif zoom_factor < 0.85:
+                                safe_pyautogui_hotkey('ctrl', '-')
+                                zoom_controller.start(dist)
+                    else:
+                        zoom_controller.stop()
+                else:
+                    zoom_controller.stop()
+                    if alt_tab_active:
+                        alt_tab_active = False
+                        safe_pyautogui_key_up('alt')
+                        alt_tab_anchor_x = None
+
+                valid_clicks = []
+                for (cx, cy, ct) in click_visuals:
+                    elapsed = now - ct
+                    if elapsed < 0.3:
+                        radius = int(8 + (elapsed * 30))
+                        cv2.circle(frame, (cx, cy), radius, (0, 255, 255), 2)
+                        cv2.circle(frame, (cx, cy), 4, (0, 255, 255), -1)
+                        valid_clicks.append((cx, cy, ct))
+                click_visuals = valid_clicks
+
+                cv2.imshow(ghost_window.window_name, frame)
+                cv2.waitKey(1)
+
+    except KeyboardInterrupt:
+        print("\n✓ Interrompido pelo usuário (Ctrl+C)")
+    except Exception as e:
+        print(f"\n✗ ERRO: {e}")
+        import traceback
+        traceback.print_exc()
+    finally:
+        safe_pyautogui_key_up('alt')
+        safe_pyautogui_key_up('shift')
+        safe_pyautogui_mouse_up()
+        print("\nLiberando recursos...")
+        camera.release()
+        cv2.destroyAllWindows()
+        print("✓ Encerrado")
+
+if __name__ == "__main__":
+    main()
