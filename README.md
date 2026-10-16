@@ -8,6 +8,7 @@ Execute o Tracker para começar. Após iniciado, o único modo de parar é inter
 - PUNHO (FIST) -> Srcoll
 - Apontar com indicador (POINT) -> Mover o Cursos
 - Pinça com indicador e dedão (PINCH) -> click
+- Duas Pinças -> ZommIn e ZoomOut
 - Concha com os dedos (DRAG) -> Arrastar
 - Duas mãos abertas (OPEN) -> Alterar janelas
 
